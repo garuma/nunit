@@ -72,34 +72,21 @@ namespace NUnit.Framework.Internal.Execution
 
         private Logger log = InternalTrace.GetLogger("WorkItemQueue");
 
-        private ConcurrentQueue<WorkItem>[] _innerQueues;
+        private BlockingCollection<WorkItem>[] _innerQueues;
+        private CancellationTokenSource _stateChangeSource = new CancellationTokenSource ();
+        private ManualResetEventSlim _pauseEvent = new ManualResetEventSlim (true);
 
         private class SavedState
         {
-            public ConcurrentQueue<WorkItem>[] InnerQueues;
+            public BlockingCollection<WorkItem>[] InnerQueues;
 
-            public SavedState(WorkItemQueue queue)
+            public SavedState(BlockingCollection<WorkItem>[] queues)
             {
-                InnerQueues = queue._innerQueues;
+                InnerQueues = queues;
             }
         }
 
         private Stack<SavedState> _savedState = new Stack<SavedState>();
-
-        /* This event is used solely for the purpose of having an optimized sleep cycle when
-         * we have to wait on an external event (Add or Remove for instance)
-         */
-        private readonly ManualResetEventSlim _mreAdd = new ManualResetEventSlim(false);
-
-        /* The whole idea is to use these two values in a transactional
-         * way to track and manage the actual data inside the underlying lock-free collection
-         * instead of directly working with it or using external locking.
-         *
-         * They are manipulated with CAS and are guaranteed to increase over time and use
-         * of the instance thus preventing ABA problems.
-         */
-        private int _addId = int.MinValue;
-        private int _removeId = int.MinValue;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="WorkItemQueue"/> class.
@@ -115,15 +102,16 @@ namespace NUnit.Framework.Internal.Execution
             State = WorkItemQueueState.Paused;
             ItemsProcessed = 0;
 
-            InitializeQueues();
+            _innerQueues = CreateQueues();
         }
 
-        private void InitializeQueues()
+        private BlockingCollection<WorkItem>[] CreateQueues()
         {
-            _innerQueues = new ConcurrentQueue<WorkItem>[PRIORITY_LEVELS];
+            var newQueues = new BlockingCollection<WorkItem>[PRIORITY_LEVELS];
 
             for (int i = 0; i < PRIORITY_LEVELS; i++)
-                _innerQueues[i] = new ConcurrentQueue<WorkItem>();
+                newQueues[i] = new BlockingCollection<WorkItem>();
+            return newQueues;
         }
 
         #region Properties
@@ -171,7 +159,7 @@ namespace NUnit.Framework.Internal.Execution
             get
             {
                 foreach (var q in _innerQueues)
-                    if (!q.IsEmpty)
+                    if (q.Count > 0)
                         return false;
 
                 return true;
@@ -201,22 +189,8 @@ namespace NUnit.Framework.Internal.Execution
             Guard.ArgumentInRange(priority >= 0 && priority < PRIORITY_LEVELS,
                 "Invalid priority specified", "priority");
 
-            do
-            {
-                int cachedAddId = _addId;
-
-                // Validate that we have are the current enqueuer
-                if (Interlocked.CompareExchange(ref _addId, cachedAddId + 1, cachedAddId) != cachedAddId)
-                    continue;
-
-                // Add to the collection
-                _innerQueues[priority].Enqueue(work);
-
-                // Wake up threads that may have been sleeping
-                _mreAdd.Set();
-
-                return;
-            } while (true);
+            // Add to the collection
+            _innerQueues[priority].TryAdd(work);
         }
 
         /// <summary>
@@ -225,63 +199,39 @@ namespace NUnit.Framework.Internal.Execution
         /// <returns>A WorkItem or null if the queue has stopped</returns>
         public WorkItem Dequeue()
         {
-            SpinWait sw = new SpinWait();
+            WorkItem item = null;
+            int index = -1;
 
-            do
-            {
-                WorkItemQueueState cachedState = State;
+            do {
+                _pauseEvent.Wait ();
 
-                if (cachedState == WorkItemQueueState.Stopped)
-                    return null; // Tell worker to terminate
-
-                int cachedRemoveId = _removeId;
-                int cachedAddId = _addId;
-
-                // Empty case (or paused)
-                if (cachedRemoveId == cachedAddId || cachedState == WorkItemQueueState.Paused)
-                {
-                    // Spin a few times to see if something changes
-                    if (sw.Count <= SPIN_COUNT)
-                    {
-                        sw.SpinOnce();
+                if (State == WorkItemQueueState.Running) {
+                    try {
+                        var token = _stateChangeSource.Token;
+                        index = BlockingCollection<WorkItem>.TakeFromAny (_innerQueues, out item, token);
+                    } catch (ArgumentException) {
+                        // if the collection is marked completed the following checks will catch it
+                    } catch (OperationCanceledException) {
+                        // if the queue state changed and cause a cancelation it will be handled further down
                     }
-                    else
-                    {
-                        // Reset to wait for an enqueue
-                        _mreAdd.Reset();
-
-                        // Recheck for an enqueue to avoid a Wait
-                        if ((cachedRemoveId != _removeId || cachedAddId != _addId) && cachedState != WorkItemQueueState.Paused)
-                        {
-                            // Queue is not empty, set the event
-                            _mreAdd.Set();
-                            continue;
-                        }
-
-                        // Wait for something to happen
-                        _mreAdd.Wait(500);
-                    }
-
-                    continue;
                 }
 
-                // Validate that we are the current dequeuer
-                if (Interlocked.CompareExchange(ref _removeId, cachedRemoveId + 1, cachedRemoveId) != cachedRemoveId)
+                var currentState = State;
+                if (currentState == WorkItemQueueState.Stopped)
+                    return null;
+                if (currentState == WorkItemQueueState.Paused)
                     continue;
-
-
-                // Dequeue our work item
-                WorkItem work = null;
-                while (work == null)
-                    foreach (var q in _innerQueues)
-                        if (q.TryDequeue(out work))
-                            break;
-
-                // Add to items processed using CAS
-                Interlocked.Increment(ref _itemsProcessed);
-
-                return work;
+                if (index != -1 && item != null) {
+                    Interlocked.Increment (ref _itemsProcessed);
+                    return item;
+                }
             } while (true);
+        }
+
+        private void CancelDequeue ()
+        {
+            var oldSource = Interlocked.Exchange (ref _stateChangeSource, new CancellationTokenSource ());
+            oldSource.Cancel ();
         }
 
         /// <summary>
@@ -292,7 +242,7 @@ namespace NUnit.Framework.Internal.Execution
             log.Info("{0}.{1} starting", Name, _savedState.Count);
 
             if (Interlocked.CompareExchange(ref _state, (int)WorkItemQueueState.Running, (int)WorkItemQueueState.Paused) == (int)WorkItemQueueState.Paused)
-                _mreAdd.Set();
+                _pauseEvent.Set ();
         }
 
         /// <summary>
@@ -302,8 +252,12 @@ namespace NUnit.Framework.Internal.Execution
         {
             log.Info("{0}.{1} stopping - {2} WorkItems processed", Name, _savedState.Count, ItemsProcessed);
 
-            if (Interlocked.Exchange(ref _state, (int)WorkItemQueueState.Stopped) != (int)WorkItemQueueState.Stopped)
-                _mreAdd.Set();
+            if (Interlocked.Exchange(ref _state, (int)WorkItemQueueState.Stopped) != (int)WorkItemQueueState.Stopped) {
+                _pauseEvent.Set ();
+                foreach (var queue in _innerQueues)
+                    queue.CompleteAdding ();
+                CancelDequeue ();
+            }
         }
 
         /// <summary>
@@ -313,7 +267,10 @@ namespace NUnit.Framework.Internal.Execution
         {
             log.Debug("{0}.{1} pausing", Name, _savedState.Count);
 
-            Interlocked.CompareExchange(ref _state, (int)WorkItemQueueState.Paused, (int)WorkItemQueueState.Running);
+            if (Interlocked.CompareExchange(ref _state, (int)WorkItemQueueState.Paused, (int)WorkItemQueueState.Running) == (int)WorkItemQueueState.Running) {
+                _pauseEvent.Reset ();
+                CancelDequeue ();
+            }
         }
 
         /// <summary>
@@ -324,9 +281,9 @@ namespace NUnit.Framework.Internal.Execution
         {
             Pause();
 
-            _savedState.Push(new SavedState(this));
-
-            InitializeQueues();
+			var newQueues = CreateQueues ();
+			var oldQueues = Interlocked.Exchange(ref _innerQueues, newQueues);
+			_savedState.Push(new SavedState(oldQueues));
 
             Start();
         }
@@ -352,6 +309,11 @@ namespace NUnit.Framework.Internal.Execution
         public static bool Wait (this ManualResetEvent mre, int millisecondsTimeout)
         {
             return mre.WaitOne(millisecondsTimeout, false);
+        }
+
+        public static bool Wait (this ManualResetEvent mre)
+        {
+            return mre.WaitOne(Timeout.Infinite, false);
         }
     }
 #endif
